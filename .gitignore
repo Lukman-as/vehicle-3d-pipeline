@@ -1,0 +1,24 @@
+# caches / editor noise
+__pycache__/
+.ipynb_checkpoints/
+.mypy_cache/
+.DS_Store
+*.asv
+.venv/
+
+# raw frames + lidar: master copy lives in Google Drive (LURA_data/);
+# only the annotated subset is kept locally and never committed
+data/raw/image/**/*.png
+data/raw/image/**/lidar_local_gta/
+data/raw/terrain/
+
+# regenerable outputs
+data/gen/saved_tracks_image/
+data/gen/eval_outputs/
+comparisons/
+
+# LaTeX byproducts
+report/*.aux
+report/*.log
+report/*.out
+report/*.toc

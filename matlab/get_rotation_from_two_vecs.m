@@ -1,0 +1,9 @@
+function R=get_rotation_from_two_vecs(A, B)
+    A = A/norm(A);
+    B = B/norm(B);
+    v = cross(A,B);
+    format long
+    ssc = [0 -v(3) v(2); v(3) 0 -v(1); -v(2) v(1) 0];
+    R = eye(3) + ssc + ssc^2*(1-dot(A,B))/(norm(v))^2;
+    assert(abs(det(R)-1)<1e-6);
+end

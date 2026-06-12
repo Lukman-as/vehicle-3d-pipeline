@@ -1,0 +1,21 @@
+# core
+numpy
+pandas
+scipy
+matplotlib
+opencv-python
+tqdm
+xmltodict
+openpyxl
+
+# fitting + rendering
+torch
+trimesh
+Pillow
+PyOpenGL
+PyOpenGL-accelerate
+PyQt5
+pygame
+
+# notebooks in priors/ and eval/
+jupyter
