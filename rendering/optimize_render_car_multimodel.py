@@ -41,7 +41,7 @@ def clear_gl_errors():
 
 class GLWidget(QOpenGLWidget):
     def __init__(self, points_file, pred_ow, pred_wb, pred_ol, pred_oh,
-                 pred_heading_angle, dist_to_move, parent=None):
+                 pred_heading_angle, dist_to_move, vehicle_type=None, parent=None):
         super().__init__(parent)
         glutInit(sys.argv)
         self.setMinimumSize(1000, 1000)
@@ -67,12 +67,20 @@ class GLWidget(QOpenGLWidget):
         self.rotX, self.rotY, self.rotZ = 10.0, 0.0, 0.0
         self.lastPos = None
 
-        # ---- fit all four type models, keep the best ----
+        # ---- fit the model(s) and keep the best ----
+        # If a labeled vehicle_type is given, fit ONLY that type's gaussian and
+        # render it; otherwise fall back to fitting all four and choosing best.
         init_angle = core.as_scalar(pred_heading_angle) + 180
+        if vehicle_type in core.VEHICLE_TYPES:
+            fit_types = [vehicle_type]
+        else:
+            if vehicle_type is not None:
+                print(f"[warn] unknown vehicle_type {vehicle_type!r}, fitting all types")
+            fit_types = core.VEHICLE_TYPES
         best, results = core.select_best_fit(
             self.points,
             ow=pred_ow * 100, wb=pred_wb * 100, ol=pred_ol * 100, oh=pred_oh * 100,
-            init_angle=init_angle)
+            init_angle=init_angle, types=fit_types)
 
         self.vehicle_type = best
         self.params = results[best]['params']
@@ -92,7 +100,8 @@ class GLWidget(QOpenGLWidget):
             print(f"[mesh] parametric model unavailable, drawing box instead: {exc}")
             self.use_mesh = False
 
-        print(f"\n[{points_file}] selected: {best.upper()}")
+        forced = " (forced by label)" if len(fit_types) == 1 else ""
+        print(f"\n[{points_file}] selected: {best.upper()}{forced}")
         for vt, r in sorted(results.items(), key=lambda kv: kv[1]['score']):
             mark = '  <-- BEST' if vt == best else ''
             print(f"   {vt:6} score={r['score']:9.2f}  = resid {r['residual']:8.2f} "
@@ -271,6 +280,7 @@ if __name__ == '__main__':
     widget = GLWidget(points,
                       row["PRED_WWOM"], row["PRED_WB"],
                       row["PRED_OL"], row["PRED_OH"],
-                      row["pred_heading_angle"], row["dist_to_move"])
+                      row["pred_heading_angle"], row["dist_to_move"],
+                      vehicle_type=render_io.canonical_type(row.get("vehicle_type")))
     widget.show()
     sys.exit(app.exec_())

@@ -41,12 +41,48 @@ RESULTS_COLUMNS = [
     "LD_OW_NON", "LD_OH_NON", "LD_OL_NON", "LENGTH_BY_GAUSSIAN", "NUM_TIRES",
 ]
 
+# Optional 36th column appended by the labeling step (CSV -> annotation JSON ->
+# matlab txt).  Files produced before labeling have only the 35 base columns.
+VEHICLE_TYPE_COLUMN = "vehicle_type"
+
+# Annotator labels (Car/SUV/Truck/Van) -> the renderers' model keys
+# (sedan/suv/truck/van, see car_models_core.VEHICLE_TYPES).
+TYPE_ALIASES = {
+    "car": "sedan", "sedan": "sedan", "saloon": "sedan",
+    "suv": "suv", "truck": "truck", "pickup": "truck",
+    "van": "van", "minivan": "van",
+}
+
+
+def canonical_type(label):
+    """Map a raw annotator label to a renderer model key, or None if unlabeled.
+
+    e.g. 'Car' -> 'sedan', 'SUV' -> 'suv'.  Returns None for blanks/NaN so the
+    renderers can fall back to fitting all types."""
+    if label is None:
+        return None
+    key = str(label).strip().lower()
+    if key in ("", "nan", "none"):
+        return None
+    return TYPE_ALIASES.get(key, key)
+
 
 def load_results(results_file=DEFAULT_RESULTS):
     """Read a MATLAB results txt into a DataFrame with named columns.
-    'target' is kept as a zero-padded string ('0035') to match file names."""
+    'target' is kept as a zero-padded string ('0035') to match file names.
+    Accepts both the 35-column (unlabeled) and 36-column (with vehicle_type)
+    layouts; a missing vehicle_type column is filled with None."""
     df = pd.read_csv(results_file, sep=r"\s+", header=None, dtype={1: str})
-    df.columns = RESULTS_COLUMNS
+    ncol = df.shape[1]
+    if ncol == len(RESULTS_COLUMNS):
+        df.columns = RESULTS_COLUMNS
+        df[VEHICLE_TYPE_COLUMN] = None
+    elif ncol == len(RESULTS_COLUMNS) + 1:
+        df.columns = RESULTS_COLUMNS + [VEHICLE_TYPE_COLUMN]
+    else:
+        raise ValueError(
+            f"{results_file} has {ncol} columns; expected "
+            f"{len(RESULTS_COLUMNS)} or {len(RESULTS_COLUMNS) + 1}")
     df["target"] = df["target"].str.zfill(4)
     return df
 
@@ -90,6 +126,8 @@ def select_car(argv=None, description="Render one reconstructed car."):
         row = df.iloc[args.index]
 
     points = load_points(row.camera, row.target, row.annotated_car_id, args.pointcloud)
+    vt = canonical_type(row.get(VEHICLE_TYPE_COLUMN))
+    label = f"  type={row[VEHICLE_TYPE_COLUMN]}->{vt}" if vt else "  type=unlabeled"
     print(f"[render_io] {row.camera} frame {row.target} obj {int(row.annotated_car_id)} "
-          f"({len(points)} points)  OLxOWxOH={row.PRED_OL:.2f}x{row.PRED_OW:.2f}x{row.PRED_OH:.2f} m")
+          f"({len(points)} points)  OLxOWxOH={row.PRED_OL:.2f}x{row.PRED_OW:.2f}x{row.PRED_OH:.2f} m{label}")
     return row, points
