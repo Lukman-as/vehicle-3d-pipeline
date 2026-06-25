@@ -33,6 +33,11 @@ import torch   # type: ignore
 PARAM_NAMES = ['A', 'C', 'D', 'E', 'F', 'G', 'OH', 'OL', 'OW', 'TW']
 VEHICLE_TYPES = ['sedan', 'suv', 'truck', 'van']
 
+# Body ground-clearance is clamped to [LO, HI] * tire_r in build_geometry so the
+# flat-bottomed body never swallows or dangles the wheels (see build_geometry).
+CLEARANCE_LO_FRAC = 0.6
+CLEARANCE_HI_FRAC = 1.1
+
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(os.path.dirname(_THIS_DIR), 'priors', 'models')
 
@@ -256,6 +261,24 @@ def build_geometry(params, vehicle_type):
         {'center': v21, 'radius': tire_r, 'height': tire_w, 'axis': axis_right},
         {'center': v22, 'radius': tire_r, 'height': tire_w, 'axis': axis_left},
     ]
+
+    # ---- clamp ground clearance so the wheels stay sensibly seated ----------
+    # The body box is flat-bottomed (no wheel arches), so the visible part of a
+    # grounded wheel equals the body-floor height y_sill = OH - C - D.  A draw
+    # with C+D ~ OH puts the floor on the ground and swallows the wheels; with
+    # C+D << OH the floor rides high and the wheels dangle.  Shift the body
+    # vertically so its floor lands in [0.6, 1.1] * tire_r (~30-55% of each
+    # wheel visible).  Only the body moves; the wheels stay grounded.  For
+    # typical (conditional-mean) reconstructions y_sill is already in band, so
+    # this is a no-op there and only tames extreme sampled draws.
+    y_sill = oh - c - d
+    target_floor = min(max(y_sill, CLEARANCE_LO_FRAC * tire_r),
+                       CLEARANCE_HI_FRAC * tire_r)
+    dy = target_floor - y_sill
+    if dy != 0.0:
+        for q in quads:
+            for v in q['vertices']:
+                v[1] += dy
 
     # ---- centre everything (x by OW/2, z by +OL/2) -- shared by all types ----
     x_shift, z_shift = ow / 2.0, ol / 2.0

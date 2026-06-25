@@ -26,6 +26,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from PIL import Image
 
 import render_io
 
@@ -47,6 +48,33 @@ def load_annotation(batch, camera, target, obj_id):
         if int(entry["obj_id"]) == int(obj_id):
             return entry["annotations"]
     raise KeyError(f"obj_id {obj_id} not in {file}")
+
+
+def crop_area(batch, camera, target, obj_id):
+    """Pixel area (w*h) of the per-object crop in the formatted_anno image/ dir.
+
+    This is the on-screen size of the car the user sees; larger crops are the
+    'biggest' cars whose annotations are most distinctively visible. Returns 0
+    if the crop is missing so such rows sort to the bottom."""
+    crop = (ROOT / "data/gen/formatted_anno" / batch / camera / "image"
+            / f"{target}_{int(obj_id)}.jpg")
+    if not crop.exists():
+        return 0
+    with Image.open(crop) as im:
+        w, h = im.size
+    return w * h
+
+
+def annotated_image_panel(batch, camera, target, obj_id):
+    """Left panel taken straight from the pre-made annotated_images/ red-dot crop
+    (data/gen/formatted_anno/<batch>/<cam>/annotated_images/<frame>_<obj>.jpg)."""
+    crop = (ROOT / "data/gen/formatted_anno" / batch / camera / "annotated_images"
+            / f"{target}_{int(obj_id)}.jpg")
+    img = cv2.imread(str(crop))
+    if img is None:
+        raise FileNotFoundError(f"missing annotated crop {crop} "
+                                "(run overlay_annotations.py first)")
+    return img
 
 
 def annotated_crop(batch, camera, target, obj_id, margin=0.30):
@@ -150,18 +178,91 @@ def pointcloud_panel(points_raw, row, out_file, dpi=110):
     plt.close(fig)
 
 
-def gl_panel(points_raw, row, out_file, app):
-    """Capture the real textured render from rendertooriginal's GLWidget."""
-    import rendertooriginal
-    widget = rendertooriginal.GLWidget(
-        points_raw, row["PRED_WWOM"], row["PRED_WB"], row["PRED_OL"],
-        row["PRED_OH"], row["pred_heading_angle"], row["dist_to_move"])
+def gl_panel(points_raw, row, out_file, app, render_module):
+    """Capture the GL render of one car from `render_module`'s GLWidget.
+
+    Passes the labeled vehicle_type when the renderer's GLWidget accepts it, so
+    it fits that type's model; otherwise the renderer falls back to fitting all
+    four types and keeping the best."""
+    widget = _build_widget(points_raw, row, render_module)
     widget.show()
     for _ in range(10):
         app.processEvents()
     widget.grabFramebuffer().save(str(out_file))
     widget.close()
     app.processEvents()
+
+
+def _build_widget(points_raw, row, render_module):
+    """Construct a renderer GLWidget, passing vehicle_type if it accepts one."""
+    import inspect
+    args = [points_raw, row["PRED_WWOM"], row["PRED_WB"], row["PRED_OL"],
+            row["PRED_OH"], row["pred_heading_angle"], row["dist_to_move"]]
+    if "vehicle_type" in inspect.signature(render_module.GLWidget).parameters:
+        args.append(render_io.canonical_type(row.get(render_io.VEHICLE_TYPE_COLUMN)))
+    return render_module.GLWidget(*args)
+
+
+def _activate_macos_app():
+    """Force this (non-bundled) Python process to become the active macOS app, so
+    its GL window comes to the front and receives keyboard/mouse focus instead of
+    opening hidden behind the terminal. No-op if AppKit isn't available."""
+    try:
+        from AppKit import NSApplication, NSApplicationActivationPolicyRegular
+        nsapp = NSApplication.sharedApplication()
+        nsapp.setActivationPolicy_(NSApplicationActivationPolicyRegular)
+        nsapp.activateIgnoringOtherApps_(True)
+    except Exception:
+        pass
+
+
+def gl_panel_interactive(points_raw, row, out_file, app, render_module, title):
+    """Pop the GL window, let the user orbit it, capture on ENTER.
+
+    Controls (handled by the renderer's GLWidget): drag = rotate, arrow keys =
+    pan, W/S = zoom.  ENTER grabs the current framebuffer to out_file; ESC (or
+    closing the window) skips this car.  Returns True if a frame was captured."""
+    from PyQt5.QtCore import QObject, QEvent, QEventLoop, Qt
+
+    widget = _build_widget(points_raw, row, render_module)
+    widget.setWindowTitle(f"{title}   [drag=rotate  arrows=pan  W/S=zoom  "
+                          f"ENTER=capture  ESC=skip]")
+    loop = QEventLoop()
+    state = {"saved": False}
+
+    class Filter(QObject):
+        def eventFilter(self, obj, ev):
+            t = ev.type()
+            if t == QEvent.KeyPress and ev.key() in (Qt.Key_Return, Qt.Key_Enter):
+                widget.grabFramebuffer().save(str(out_file))
+                state["saved"] = True
+                loop.quit()
+                return True
+            if t == QEvent.KeyPress and ev.key() == Qt.Key_Escape:
+                loop.quit()
+                return True
+            if t == QEvent.Close:
+                loop.quit()
+            return False
+
+    filt = Filter()
+    widget.installEventFilter(filt)
+    widget.resize(1000, 1000)
+    # keep the window above the terminal and force it frontmost so drag/keys land
+    widget.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+    widget.show()
+    widget.raise_()
+    widget.activateWindow()
+    widget.setFocus()
+    _activate_macos_app()
+    app.processEvents()
+    widget.raise_()
+    widget.activateWindow()
+    loop.exec_()
+    widget.removeEventFilter(filt)
+    widget.close()
+    app.processEvents()
+    return state["saved"]
 
 
 def compose(left_bgr, right_file, out_file, header):
@@ -202,50 +303,95 @@ def main():
                     help="formatted_anno batch the results were computed from")
     ap.add_argument("--out", default=str(ROOT / "comparisons"))
     ap.add_argument("--limit", type=int, help="only the first N results rows")
+    ap.add_argument("--top", type=int,
+                    help="only the N biggest cars by crop area (most visible)")
     ap.add_argument("--cam"); ap.add_argument("--frame")
     ap.add_argument("--obj", type=int)
     ap.add_argument("--gl", action="store_true",
                     help="right panel = real OpenGL render (needs display + torch)")
+    ap.add_argument("--renderer", default="originalrender",
+                    help="GL render module to use (default: originalrender, the "
+                         "parametric polygon model). e.g. optimize_render_car_"
+                         "multimodel, rendertooriginal, optimize_render_car")
+    ap.add_argument("--left", choices=("reddots", "overlay"), default="reddots",
+                    help="left panel source: 'reddots' = the pre-made "
+                         "annotated_images/ crops (default), 'overlay' = draw the "
+                         "colored symmetry overlay on the raw frame")
+    ap.add_argument("--interactive", action="store_true",
+                    help="pop each GL window to orbit, press ENTER to capture "
+                         "the angle you want (ESC skips). Implies --gl.")
+    ap.add_argument("--force", action="store_true",
+                    help="re-render even if the output png already exists")
     args = ap.parse_args()
+    if args.interactive:
+        args.gl = True
 
     df = render_io.load_results(args.results)
     if args.cam and args.frame and args.obj is not None:
         df = df[(df.camera == args.cam) & (df.target == str(args.frame).zfill(4))
                 & (df.annotated_car_id == args.obj)]
+    if args.top:
+        df = df.assign(_area=[crop_area(args.batch, r.camera, r.target,
+                                        r.annotated_car_id)
+                              for _, r in df.iterrows()])
+        df = df.sort_values("_area", ascending=False).head(args.top)
+        print(f"selected {len(df)} biggest cars "
+              f"(crop area {int(df._area.min())}..{int(df._area.max())} px)")
     if args.limit:
         df = df.iloc[:args.limit]
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    app = None
+    app = render_module = None
     if args.gl:
+        import importlib
         from PyQt5.QtWidgets import QApplication
         app = QApplication([])
+        render_module = importlib.import_module(args.renderer)
+        if args.interactive:
+            _activate_macos_app()
+        print(f"GL renderer: {args.renderer}")
 
+    total = len(df)
     items, skipped = [], 0
-    for _, row in df.iterrows():
+    for i, (_, row) in enumerate(df.iterrows(), 1):
         cam, target, obj = row.camera, row.target, int(row.annotated_car_id)
         name = f"{cam}_{target}_obj{obj}.png"
+        meta = (f"{cam} frame {target} obj {obj} | "
+                f"OL={row.PRED_OL:.2f} OW={row.PRED_WWOM:.2f} "
+                f"OH={row.PRED_OH:.2f} WB={row.PRED_WB:.2f} m | "
+                f"heading={row.pred_heading_angle:.1f} deg | iou={row.iou:.2f}")
+        if not args.force and (out_dir / name).exists():
+            items.append((name, meta))
+            print(f"[{i}/{total}] resume: keep existing {name}")
+            continue
         try:
             pts = render_io.load_points(cam, target, obj, args.pointcloud)
-            left = annotated_crop(args.batch, cam, target, obj)
+            if args.left == "overlay":
+                left = annotated_crop(args.batch, cam, target, obj)
+            else:
+                left = annotated_image_panel(args.batch, cam, target, obj)
             panel = out_dir / f"_panel_{name}"
-            if args.gl:
-                gl_panel(pts, row, panel, app)
+            if args.interactive:
+                print(f"\n[{i}/{total}] {cam} {target} obj {obj}  (iou={row.iou:.2f})\n"
+                      f"          window is frontmost: DRAG=rotate  ARROWS=pan  "
+                      f"W/S=zoom  ENTER=capture  ESC=skip")
+                if not gl_panel_interactive(pts, row, panel, app, render_module, meta):
+                    skipped += 1
+                    print(f"[{i}/{total}] skipped (no capture) {name}")
+                    continue
+            elif args.gl:
+                gl_panel(pts, row, panel, app, render_module)
             else:
                 pointcloud_panel(pts, row, panel)
-            meta = (f"{cam} frame {target} obj {obj} | "
-                    f"OL={row.PRED_OL:.2f} OW={row.PRED_WWOM:.2f} "
-                    f"OH={row.PRED_OH:.2f} WB={row.PRED_WB:.2f} m | "
-                    f"heading={row.pred_heading_angle:.1f} deg | iou={row.iou:.2f}")
             compose(left, panel, out_dir / name, meta)
             panel.unlink()
             items.append((name, meta))
-            print("wrote", name)
+            print(f"[{i}/{total}] wrote {name}")
         except (FileNotFoundError, KeyError) as e:
             skipped += 1
-            print(f"skip {cam} {target} obj {obj}: {e}")
+            print(f"[{i}/{total}] skip {cam} {target} obj {obj}: {e}")
 
     index = write_index(out_dir, items)
     print(f"\n{len(items)} comparisons written, {skipped} skipped")
